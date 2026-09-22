@@ -1,0 +1,53 @@
+[package]
+name = "jevai"
+version = "0.1.0"
+edition = "2024"
+# reqwest 0.13 requires 1.85. Types-only builds (--no-default-features) work on
+# 1.81, but Cargo has no per-feature MSRV.
+rust-version = "1.85"
+description = "Typed message layer and client for the TypeSafe System One (Jev) API"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["rkyv", "client", "rustls-tls"]
+# Zero-copy archival of every message type. Off => serde-only, much lighter build.
+rkyv = ["dep:rkyv"]
+# The async HTTP client. Off => types only, no reqwest/tokio.
+client = ["dep:reqwest", "dep:thiserror", "dep:tokio", "dep:gloo-timers"]
+# TLS backends (native targets only; ignored on wasm, where the browser does TLS).
+rustls-tls = ["reqwest?/rustls"]
+native-tls = ["reqwest?/native-tls"]
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+rkyv = { version = "0.8.18", optional = true }
+thiserror = { version = "2.0.20", optional = true }
+
+# Native: full async stack. `charset` is deliberately omitted — the API is
+# UTF-8 JSON, and it costs encoding_rs + mime.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.13.5", optional = true, default-features = false, features = ["http2"] }
+tokio = { version = "1.53", optional = true, default-features = false, features = ["time"] }
+
+# wasm: the browser supplies fetch and TLS, so no hyper, no tokio, no rustls.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+reqwest = { version = "0.13.5", optional = true, default-features = false }
+gloo-timers = { version = "0.4", optional = true, features = ["futures"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+wiremock = "0.6.5"
+
+# Needs the client (and tokio, from dev-dependencies) to build at all.
+[[example]]
+name = "live"
+required-features = ["client"]
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
