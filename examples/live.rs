@@ -22,7 +22,6 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     let client = JevClient::builder(&key)
         .timeout(Duration::from_secs(30))
-        .retries(3)
         .build()?;
 
     let request = Request::new(STATE)
@@ -53,7 +52,17 @@ async fn main() -> Result<(), Box<dyn StdError>> {
 
     println!("→ POST {}\n  {}\n", jevai::ENDPOINT, serde_json::to_string(&request)?);
 
-    let response = client.send(&request).await?;
+    // Two stages: the head arrives first, so the request id and the server's
+    // own timing are readable before a single byte of the body is parsed.
+    let received = client.send(&request).await?;
+    println!(
+        "← {} request={} server_time={:?}",
+        received.status(),
+        received.request_id().unwrap_or("<none>"),
+        received.server_time(),
+    );
+
+    let response = received.json().await?;
     report(&response);
     archive(&response)?;
     demo_errors(&client, &key).await?;
@@ -126,14 +135,14 @@ async fn demo_errors(client: &JevClient, key: &str) -> Result<(), Box<dyn StdErr
     let bad_model = Request::new("x")
         .with_model(Model::Version("gpt-4".into()))
         .ask("q", Question::noul("y?"));
-    report_error("unknown model", client.send(&bad_model).await.unwrap_err());
+    report_error("unknown model", client.ask(&bad_model).await.unwrap_err());
 
     // Reachable: a key is just a string until the server sees it.
     let bad_key = JevClient::new(format!("{key}_wrong"))?;
     report_error(
         "bad api key",
         bad_key
-            .send(&Request::new("x").ask("q", Question::noul("y?")))
+            .ask(&Request::new("x").ask("q", Question::noul("y?")))
             .await
             .unwrap_err(),
     );
@@ -152,8 +161,12 @@ async fn demo_errors(client: &JevClient, key: &str) -> Result<(), Box<dyn StdErr
 }
 
 fn report_error(label: &str, error: ClientError) {
+    // The request id survives into the error, which is where it is needed most.
+    if let Some(id) = error.request_id() {
+        println!("  {:<22} request={id}", "");
+    }
     match &error {
-        ClientError::Api { status, error: api } => {
+        ClientError::Api { status, error: api, .. } => {
             println!(
                 "  {label:<22} {status} retryable={:<5} {api}",
                 status.is_retryable()

@@ -2,8 +2,17 @@
 //!
 //! Compiles for native targets and for `wasm32-unknown-unknown`. On native it
 //! runs on hyper/tokio; in a browser it runs on `fetch`, where the browser
-//! supplies TLS and scheduling. The differences are confined to two places,
-//! both marked below: the request timeout and the backoff sleep.
+//! supplies TLS and scheduling. Exactly one thing differs between the two: the
+//! request timeout, which `fetch` does not expose.
+//!
+//! # Two stages
+//!
+//! [`JevClient::send`] resolves as soon as the response *head* arrives and
+//! hands back a [`Received`], which still owns an unread body. Status and
+//! headers are available immediately; the body is read only when you ask for
+//! it. This is reqwest's own division, and it is why nothing here retries on
+//! your behalf — a client that hands out an unread body cannot know whether it
+//! is safe to send the request again.
 //!
 //! ```no_run
 //! # use jevai::{JevClient, Question, Request};
@@ -12,16 +21,31 @@
 //! let request = Request::new("Payouts have been failing for 3 days.")
 //!     .ask("is_urgent", Question::noul("Does this convey urgency?"));
 //!
-//! let response = client.send(&request).await?;
+//! let received = client.send(&request).await?;
+//! println!("request {:?}", received.request_id());
+//!
+//! let response = received.json().await?;
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! When the head is of no interest, [`JevClient::ask`] collapses both stages.
+//!
+//! # Retrying
+//!
+//! There is no retry loop. A `429` or `529` surfaces as [`Error::Api`], and
+//! [`ApiStatus::is_retryable`] tells you which statuses are worth sending
+//! again. [`Received::retry_after`] reports the server's own requested delay.
+//!
+//! Retry with care: the API has no idempotency key and bills input tokens on
+//! arrival, so re-sending a request that may already have been processed can
+//! pay for it twice. A response that never arrived is not proof that the
+//! request never did.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use reqwest::header::{HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
 
 use crate::error::{ApiError, ApiStatus};
 use crate::message::{Request, Response};
@@ -29,7 +53,25 @@ use crate::message::{Request, Response};
 /// Default per-request timeout. Ignored on wasm, which has no timeout knob.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Anything that can go wrong sending a request.
+/// Response header carrying the id to quote when reporting a problem.
+pub const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
+
+/// Response header carrying upstream processing time, in milliseconds.
+pub const SERVER_TIME_HEADER: &str = "x-envoy-upstream-service-time";
+
+/// Renders an optional request id as a trailing note, or nothing.
+struct IdNote<'a>(Option<&'a str>);
+
+impl fmt::Display for IdNote<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, " (request {id})"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Anything that can go wrong sending a request or reading its body.
 ///
 /// Derives [`thiserror::Error`] and is `Send + Sync + 'static` on every target,
 /// so it drops straight into [`anyhow`](https://docs.rs/anyhow) with `?`.
@@ -37,27 +79,37 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 #[non_exhaustive]
 pub enum Error {
     /// The API rejected the request and explained why.
-    #[error("api returned {status}: {error}")]
+    #[error("api returned {status}: {error}{}", IdNote(.request_id.as_deref()))]
     Api {
         /// The HTTP status, interpreted.
         status: ApiStatus,
         /// The parsed error body.
         error: ApiError,
+        /// Value of [`REQUEST_ID_HEADER`], when the server sent one.
+        request_id: Option<String>,
     },
 
     /// A non-2xx response whose body was not a recognizable API error — a
     /// proxy or gateway page, usually. The body is kept rather than discarded.
-    #[error("api returned {status} with an unrecognized body: {body}")]
+    #[error("api returned {status} with an unrecognized body{}: {body}", IdNote(.request_id.as_deref()))]
     UnexpectedBody {
         /// The HTTP status, interpreted.
         status: ApiStatus,
         /// The raw response body, truncated to a readable length.
         body: String,
+        /// Value of [`REQUEST_ID_HEADER`], when the server sent one.
+        request_id: Option<String>,
     },
 
     /// A 2xx response that did not parse as a [`Response`].
-    #[error("could not decode a successful response: {0}")]
-    Decode(#[source] serde_json::Error),
+    #[error("could not decode a successful response{}: {source}", IdNote(.request_id.as_deref()))]
+    Decode {
+        /// The underlying parse failure.
+        #[source]
+        source: serde_json::Error,
+        /// Value of [`REQUEST_ID_HEADER`], when the server sent one.
+        request_id: Option<String>,
+    },
 
     /// The request could not be serialized.
     #[error("could not encode the request: {0}")]
@@ -70,64 +122,28 @@ pub enum Error {
     /// Connection, TLS, timeout, or client construction failure.
     #[error("transport: {0}")]
     Transport(#[from] reqwest::Error),
-
-    /// Every retry was used up. Carries the final failure.
-    #[error("gave up after {attempts} attempts: {last}")]
-    RetriesExhausted {
-        /// How many attempts were made in total.
-        attempts: u32,
-        /// The failure from the last attempt.
-        #[source]
-        last: Box<Error>,
-    },
 }
 
-/// How failed requests are retried.
-///
-/// The defaults retry only what is safe to retry. See
-/// [`retry_read_timeouts`](Self::retry_read_timeouts) for the one case that is
-/// genuinely a judgement call.
-#[derive(Clone, Debug)]
-pub struct RetryPolicy {
-    /// Total attempts including the first. `1` disables retrying.
-    pub max_attempts: u32,
-    /// Delay before the second attempt; doubles from there by `multiplier`.
-    pub initial_backoff: Duration,
-    /// Ceiling for a single backoff.
-    pub max_backoff: Duration,
-    /// Growth factor applied per attempt.
-    pub multiplier: f64,
-    /// Spread retries out so concurrent clients do not resynchronize.
-    pub jitter: bool,
-    /// Retry a request that timed out while waiting for the response body.
+impl Error {
+    /// The server-assigned request id, when the failure carried one.
     ///
-    /// Off by default, and this is deliberate. The API has no idempotency key,
-    /// and input tokens are billed on arrival, so a request that timed out may
-    /// already have been processed and charged. Retrying it can pay twice.
-    /// Connection failures are always retried — those never reached the server.
-    pub retry_read_timeouts: bool,
-}
-
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        Self {
-            max_attempts: 3,
-            initial_backoff: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(30),
-            multiplier: 2.0,
-            jitter: true,
-            retry_read_timeouts: false,
+    /// Quote this when reporting a problem to the API operator.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Api { request_id, .. }
+            | Self::UnexpectedBody { request_id, .. }
+            | Self::Decode { request_id, .. } => request_id.as_deref(),
+            _ => None,
         }
     }
-}
 
-impl RetryPolicy {
-    /// A policy that never retries.
+    /// The interpreted status, for failures that reached the server.
     #[must_use]
-    pub fn none() -> Self {
-        Self {
-            max_attempts: 1,
-            ..Self::default()
+    pub fn status(&self) -> Option<ApiStatus> {
+        match self {
+            Self::Api { status, .. } | Self::UnexpectedBody { status, .. } => Some(*status),
+            _ => None,
         }
     }
 }
@@ -148,7 +164,6 @@ pub struct JevClientBuilder {
     api_key: String,
     endpoint: String,
     timeout: Duration,
-    retry: RetryPolicy,
 }
 
 impl JevClientBuilder {
@@ -167,37 +182,6 @@ impl JevClientBuilder {
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
-        self
-    }
-
-    /// Replaces the whole retry policy.
-    #[must_use]
-    pub fn retry_policy(mut self, retry: RetryPolicy) -> Self {
-        self.retry = retry;
-        self
-    }
-
-    /// Sets the total number of attempts, including the first.
-    #[must_use]
-    pub fn retries(mut self, max_attempts: u32) -> Self {
-        self.retry.max_attempts = max_attempts.max(1);
-        self
-    }
-
-    /// Sets the delay before the second attempt.
-    #[must_use]
-    pub fn initial_backoff(mut self, backoff: Duration) -> Self {
-        self.retry.initial_backoff = backoff;
-        self
-    }
-
-    /// Enables retrying requests that timed out waiting for a response.
-    ///
-    /// Read [`RetryPolicy::retry_read_timeouts`] before turning this on: it can
-    /// double-bill a request the server already processed.
-    #[must_use]
-    pub fn retry_read_timeouts(mut self, retry: bool) -> Self {
-        self.retry.retry_read_timeouts = retry;
         self
     }
 
@@ -225,8 +209,6 @@ impl JevClientBuilder {
             http: builder.build()?,
             auth: ApiKey(auth),
             endpoint: self.endpoint,
-            retry: self.retry,
-            rng: AtomicU64::new(0x2545_F491_4F6C_DD1D),
         })
     }
 }
@@ -236,31 +218,15 @@ impl JevClientBuilder {
 /// Cloning is cheap — the inner HTTP client shares one connection pool — so
 /// build one and share it. Concurrent requests reuse the same connection over
 /// HTTP/2.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct JevClient {
     http: reqwest::Client,
     auth: ApiKey,
     endpoint: String,
-    retry: RetryPolicy,
-    rng: AtomicU64,
-}
-
-impl Clone for JevClient {
-    /// Clones share the connection pool; only the jitter state is forked so
-    /// two clones do not emit an identical backoff sequence.
-    fn clone(&self) -> Self {
-        Self {
-            http: self.http.clone(),
-            auth: self.auth.clone(),
-            endpoint: self.endpoint.clone(),
-            retry: self.retry.clone(),
-            rng: AtomicU64::new(self.next_rand()),
-        }
-    }
 }
 
 impl JevClient {
-    /// Builds a client with default timeout and retry policy.
+    /// Builds a client with the default timeout.
     ///
     /// # Errors
     /// See [`JevClientBuilder::build`].
@@ -275,181 +241,193 @@ impl JevClient {
             api_key: api_key.into(),
             endpoint: crate::ENDPOINT.to_owned(),
             timeout: DEFAULT_TIMEOUT,
-            retry: RetryPolicy::default(),
         }
     }
 
-    /// The retry policy in force.
+    /// The endpoint this client posts to.
     #[must_use]
-    pub fn retry_policy(&self) -> &RetryPolicy {
-        &self.retry
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
-    /// Sends one request, retrying per the policy.
+    /// Sends one request and returns once the response head has arrived.
+    ///
+    /// The body is left unread on the wire. A non-2xx status is *not* an error
+    /// here — the status is known but the explanation is still in the body, so
+    /// classification happens in [`Received::json`].
     ///
     /// The returned future is `Send` on native targets and `!Send` on wasm,
     /// because a `fetch` future is not `Send`. No `Send` bound is imposed
     /// anywhere, so the same call compiles for both.
     ///
     /// # Errors
-    /// [`Error::Api`] when the server rejected the request, [`Error::Transport`]
-    /// for network failures, [`Error::RetriesExhausted`] when retries ran out.
-    pub async fn send(&self, request: &Request) -> Result<Response, Error> {
+    /// [`Error::Encode`] if the request will not serialize, or
+    /// [`Error::Transport`] if the exchange never produced a response head.
+    pub async fn send(&self, request: &Request) -> Result<Received, Error> {
         let body = serde_json::to_vec(request).map_err(Error::Encode)?;
-        let mut attempt = 0;
 
-        loop {
-            attempt += 1;
-            let retryable = match self.attempt(&body).await {
-                Outcome::Done(response) => return Ok(response),
-                Outcome::Fatal(error) => return Err(error),
-                Outcome::Retry { after, error } => (after, error),
-            };
-            let (retry_after, error) = retryable;
-
-            if attempt >= self.retry.max_attempts {
-                return Err(Error::RetriesExhausted {
-                    attempts: attempt,
-                    last: Box::new(error),
-                });
-            }
-
-            sleep(retry_after.unwrap_or_else(|| self.backoff(attempt))).await;
-        }
-    }
-
-    /// One trip to the server, classified.
-    async fn attempt(&self, body: &[u8]) -> Outcome {
-        let sent = self
+        let http = self
             .http
             .post(&self.endpoint)
             .header(AUTHORIZATION, self.auth.0.clone())
             .header(CONTENT_TYPE, "application/json")
-            .body(body.to_vec())
+            .body(body)
             .send()
-            .await;
+            .await?;
 
-        let http = match sent {
-            Ok(http) => http,
-            Err(error) => {
-                return if self.transport_is_retryable(&error) {
-                    Outcome::Retry {
-                        after: None,
-                        error: Error::Transport(error),
-                    }
-                } else {
-                    Outcome::Fatal(Error::Transport(error))
-                };
-            }
-        };
+        Ok(Received { http })
+    }
 
-        let status = ApiStatus::from_code(http.status().as_u16());
-        let retry_after = parse_retry_after(http.headers().get(RETRY_AFTER));
-        let success = http.status().is_success();
+    /// Sends one request and reads the answer, discarding the head.
+    ///
+    /// Shorthand for `send(request).await?.json().await`. Use [`send`] instead
+    /// when you want the request id or the response headers.
+    ///
+    /// [`send`]: Self::send
+    ///
+    /// # Errors
+    /// Any [`Error`] from either stage.
+    pub async fn ask(&self, request: &Request) -> Result<Response, Error> {
+        self.send(request).await?.json().await
+    }
+}
 
-        let bytes = match http.bytes().await {
-            Ok(bytes) => bytes,
-            Err(error) => return Outcome::Fatal(Error::Transport(error)),
-        };
+/// A response head, with its body still unread.
+///
+/// Every accessor here takes `&self` and reads only the head. The body is
+/// consumed by [`json`](Self::json), [`bytes`](Self::bytes) or
+/// [`text`](Self::text), each of which takes `self` — so the body can be read
+/// exactly once, and the compiler enforces it.
+#[derive(Debug)]
+pub struct Received {
+    http: reqwest::Response,
+}
+
+impl Received {
+    /// The HTTP status, interpreted.
+    #[must_use]
+    pub fn status(&self) -> ApiStatus {
+        ApiStatus::from_code(self.http.status().as_u16())
+    }
+
+    /// Whether the status is 2xx.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.http.status().is_success()
+    }
+
+    /// Every response header.
+    #[must_use]
+    pub fn headers(&self) -> &HeaderMap {
+        self.http.headers()
+    }
+
+    /// The server-assigned request id, from [`REQUEST_ID_HEADER`].
+    ///
+    /// Quote this when reporting a problem to the API operator.
+    #[must_use]
+    pub fn request_id(&self) -> Option<&str> {
+        self.http.headers().get(REQUEST_ID_HEADER)?.to_str().ok()
+    }
+
+    /// How long the upstream spent on this request, from
+    /// [`SERVER_TIME_HEADER`].
+    ///
+    /// Compare against your own measured round trip to separate evaluation
+    /// time from network time.
+    #[must_use]
+    pub fn server_time(&self) -> Option<Duration> {
+        let millis: u64 = self
+            .http
+            .headers()
+            .get(SERVER_TIME_HEADER)?
+            .to_str()
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        Some(Duration::from_millis(millis))
+    }
+
+    /// The delay the server asked for before trying again, if any.
+    ///
+    /// Only the delta-seconds form is read. The HTTP-date form would need
+    /// wall-clock "now", and `SystemTime::now()` panics on
+    /// `wasm32-unknown-unknown`, so a date-valued header reports `None` rather
+    /// than breaking the browser build.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        parse_retry_after(self.http.headers().get(RETRY_AFTER))
+    }
+
+    /// The body length the server declared, if it declared one.
+    #[must_use]
+    pub fn content_length(&self) -> Option<u64> {
+        self.http.content_length()
+    }
+
+    /// Reads the body and interprets it.
+    ///
+    /// # Errors
+    /// [`Error::Api`] or [`Error::UnexpectedBody`] for a non-2xx status,
+    /// [`Error::Decode`] for a 2xx body that is not a [`Response`], and
+    /// [`Error::Transport`] if the body could not be read.
+    pub async fn json(self) -> Result<Response, Error> {
+        let status = self.status();
+        let success = self.is_success();
+        let request_id = self.request_id().map(ToOwned::to_owned);
+
+        let bytes = self.http.bytes().await?;
 
         if success {
-            return match serde_json::from_slice::<Response>(&bytes) {
-                Ok(response) => Outcome::Done(response),
-                Err(error) => Outcome::Fatal(Error::Decode(error)),
-            };
+            return serde_json::from_slice(&bytes).map_err(|source| Error::Decode {
+                source,
+                request_id,
+            });
         }
 
-        let error = match serde_json::from_slice::<ApiError>(&bytes) {
-            Ok(error) => Error::Api { status, error },
+        Err(match serde_json::from_slice::<ApiError>(&bytes) {
+            Ok(error) => Error::Api {
+                status,
+                error,
+                request_id,
+            },
             Err(_) => Error::UnexpectedBody {
                 status,
                 body: truncate(&String::from_utf8_lossy(&bytes)),
+                request_id,
             },
-        };
-
-        if status.is_retryable() {
-            Outcome::Retry {
-                after: retry_after,
-                error,
-            }
-        } else {
-            Outcome::Fatal(error)
-        }
+        })
     }
 
-    /// Whether a transport failure can be retried without risking a double bill.
+    /// Reads the body as raw bytes, whatever the status.
     ///
-    /// On native targets a connect or DNS failure provably never reached the
-    /// server, so nothing was billed and retrying is free.
-    ///
-    /// In a browser there is no such signal: `fetch` reports a failure without
-    /// saying whether the request was delivered, so every transport failure is
-    /// treated as possibly-executed and follows the opt-in timeout policy. A
-    /// wasm build therefore retries strictly less than a native one.
-    fn transport_is_retryable(&self, error: &reqwest::Error) -> bool {
-        #[cfg(not(target_arch = "wasm32"))]
-        let never_reached_server = error.is_connect() || error.is_dns();
-        #[cfg(target_arch = "wasm32")]
-        let never_reached_server = false;
-
-        if never_reached_server {
-            return true;
-        }
-
-        self.retry.retry_read_timeouts && (error.is_timeout() || error.is_request())
+    /// # Errors
+    /// [`Error::Transport`] if the body could not be read.
+    pub async fn bytes(self) -> Result<Vec<u8>, Error> {
+        Ok(self.http.bytes().await?.to_vec())
     }
 
-    /// Exponential backoff with equal jitter.
-    fn backoff(&self, attempt: u32) -> Duration {
-        let base = self.retry.initial_backoff.as_millis() as f64
-            * self.retry.multiplier.powi(attempt.saturating_sub(1) as i32);
-        let capped = base.min(self.retry.max_backoff.as_millis() as f64).max(0.0);
-
-        let millis = if self.retry.jitter {
-            // Equal jitter: half fixed, half random. Full jitter can collapse
-            // to ~0 and hammer a server that just asked for room.
-            let unit = (self.next_rand() >> 11) as f64 / (1u64 << 53) as f64;
-            capped / 2.0 + capped / 2.0 * unit
-        } else {
-            capped
-        };
-
-        Duration::from_millis(millis as u64)
+    /// Reads the body as text, whatever the status.
+    ///
+    /// # Errors
+    /// [`Error::Transport`] if the body could not be read.
+    pub async fn text(self) -> Result<String, Error> {
+        Ok(self.http.text().await?)
     }
 
-    /// xorshift64*, seeded per client.
+    /// Unwraps to the underlying reqwest response.
     ///
-    /// Deliberately not the `rand` crate, and deliberately not clock-seeded:
-    /// `SystemTime::now()` panics on `wasm32-unknown-unknown`. Jitter needs
-    /// decorrelation, not cryptographic quality.
-    fn next_rand(&self) -> u64 {
-        let mut x = self
-            .rng
-            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
-            | 1;
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    /// For the cases this wrapper does not cover — streaming the body with
+    /// `bytes_stream`, reading cookies, inspecting the negotiated version.
+    #[must_use]
+    pub fn into_inner(self) -> reqwest::Response {
+        self.http
     }
 }
 
-/// What one attempt produced.
-enum Outcome {
-    Done(Response),
-    Retry {
-        after: Option<Duration>,
-        error: Error,
-    },
-    Fatal(Error),
-}
-
-/// Reads a `retry-after` header.
-///
-/// Only the delta-seconds form is supported. The HTTP-date form would need
-/// wall-clock "now", and `SystemTime::now()` panics on
-/// `wasm32-unknown-unknown`; a date-valued header falls back to exponential
-/// backoff instead of breaking the browser build.
+/// Reads a `retry-after` header. Delta-seconds form only; see
+/// [`Received::retry_after`].
 fn parse_retry_after(header: Option<&HeaderValue>) -> Option<Duration> {
     let seconds: u64 = header?.to_str().ok()?.trim().parse().ok()?;
     Some(Duration::from_secs(seconds))
@@ -466,15 +444,6 @@ fn truncate(body: &str) -> String {
         end -= 1;
     }
     format!("{}… ({} bytes total)", &body[..end], body.len())
-}
-
-/// Backoff sleep. The only other place the targets diverge.
-async fn sleep(duration: Duration) {
-    #[cfg(not(target_arch = "wasm32"))]
-    tokio::time::sleep(duration).await;
-
-    #[cfg(target_arch = "wasm32")]
-    gloo_timers::future::TimeoutFuture::new(duration.as_millis() as u32).await;
 }
 
 #[cfg(test)]
@@ -516,45 +485,35 @@ mod tests {
     }
 
     #[test]
-    fn backoff_grows_and_stays_capped() {
-        let client = JevClient::builder("k")
-            .retry_policy(RetryPolicy {
-                jitter: false,
-                initial_backoff: Duration::from_millis(100),
-                max_backoff: Duration::from_millis(400),
-                ..RetryPolicy::default()
-            })
-            .build()
-            .unwrap();
-
-        assert_eq!(client.backoff(1), Duration::from_millis(100));
-        assert_eq!(client.backoff(2), Duration::from_millis(200));
-        assert_eq!(client.backoff(3), Duration::from_millis(400));
-        assert_eq!(client.backoff(9), Duration::from_millis(400), "capped");
+    fn error_display_mentions_the_request_id() {
+        let error = Error::UnexpectedBody {
+            status: ApiStatus::from_code(502),
+            body: "<html>bad gateway</html>".to_owned(),
+            request_id: Some("req_abc123".to_owned()),
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("req_abc123"), "{rendered}");
+        assert_eq!(error.request_id(), Some("req_abc123"));
     }
 
     #[test]
-    fn jitter_stays_within_half_the_window_and_varies() {
-        let client = JevClient::builder("k")
-            .retry_policy(RetryPolicy {
-                initial_backoff: Duration::from_millis(1000),
-                max_backoff: Duration::from_secs(60),
-                ..RetryPolicy::default()
-            })
-            .build()
-            .unwrap();
+    fn error_display_omits_an_absent_request_id() {
+        let error = Error::UnexpectedBody {
+            status: ApiStatus::from_code(502),
+            body: "nope".to_owned(),
+            request_id: None,
+        };
+        assert!(!error.to_string().contains("request "), "{error}");
+        assert_eq!(error.request_id(), None);
+    }
 
-        let samples: Vec<_> = (0..32).map(|_| client.backoff(1)).collect();
-        for sample in &samples {
-            assert!(
-                *sample >= Duration::from_millis(500) && *sample <= Duration::from_millis(1000),
-                "equal jitter must stay in [half, full]: {sample:?}"
-            );
-        }
-        assert!(
-            samples.iter().collect::<std::collections::HashSet<_>>().len() > 1,
-            "jitter must actually vary"
-        );
+    #[test]
+    fn transport_errors_carry_no_request_id_or_status() {
+        let client = JevClient::new("k").unwrap();
+        assert_eq!(client.endpoint(), crate::ENDPOINT);
+        let error = Error::Encode(serde_json::from_str::<Response>("!").unwrap_err());
+        assert_eq!(error.request_id(), None);
+        assert_eq!(error.status(), None);
     }
 
     #[test]

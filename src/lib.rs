@@ -15,9 +15,15 @@
 //! # Sending requests
 //!
 //! The `client` feature (on by default) adds [`JevClient`], an async client
-//! built on reqwest that retries `429`/`529` with backoff. It compiles for
-//! native targets and for `wasm32-unknown-unknown`. Turn the feature off to get
-//! the types alone with no HTTP stack.
+//! built on reqwest. It compiles for native targets and for
+//! `wasm32-unknown-unknown`. Turn the feature off to get the types alone with
+//! no HTTP stack.
+//!
+//! Like reqwest, it splits the exchange in two: [`JevClient::send`] resolves on
+//! the response head and returns a [`Received`] whose body is still unread, so
+//! the request id and the response headers are available before anything is
+//! parsed. [`JevClient::ask`] collapses both stages when the head does not
+//! matter. Nothing is retried for you — see [`client`] for why.
 //!
 //! The one thing this costs: [`serde_json::Value`] has no `rkyv::Archive` impl,
 //! so the polymorphic `string | object | array` fields use [`Json`] instead.
@@ -64,7 +70,7 @@ pub mod question;
 
 pub use answer::Answer;
 #[cfg(feature = "client")]
-pub use client::{JevClient, JevClientBuilder, RetryPolicy};
+pub use client::{JevClient, JevClientBuilder, Received};
 pub use error::{ApiError, ApiStatus, ErrorDetail, ErrorType, StructuredError, ValidationError};
 pub use json::{Json, Map};
 pub use message::{Model, Request, Response, Usage};
